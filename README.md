@@ -85,5 +85,17 @@ To simulate the processor waveforms using **ModelSim** or **Icarus Verilog**:
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/Alixer1/MultiCycle.git](https://github.com/Alixer1/MultiCycle.git)
+   git clone https://github.com/Alixer1/MultiCycle.git
    cd MultiCycle
+   ```
+2. Compile and run simulation:
+   ```bash
+   iverilog -o multi_cycle_tb *.v
+   vvp multi_cycle_tb
+   ```
+3. View output waveforms:
+   ```bash
+   gtkwave waveform.vcd
+   ```
+
+---
