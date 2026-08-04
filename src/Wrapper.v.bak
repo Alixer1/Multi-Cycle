@@ -1,0 +1,182 @@
+`include "Definitions.v"
+
+module Top_Processor (
+    input wire clk,
+    input wire rst,
+    
+    // data buses to talk to memory
+    input wire mem_ready,           
+    input wire [127:0] mem_block_in,
+    input wire [31:0] mem_data_in,  
+    output wire [31:0] mem_addr,    
+    output wire [31:0] mem_write_data, 
+    output wire mem_global_read,
+    output wire mem_global_write    
+);
+    reg [31:0] PC;
+    wire [31:0] instr;
+    reg [31:0] IR;    
+    reg [31:0] MDR;
+
+    wire [5:0] opcode = IR[31:26];
+    wire [4:0] rs = IR[25:21];
+    wire [4:0] rt = IR[20:16];
+    wire [4:0] rd = IR[15:11];
+    wire [5:0] funct = IR[5:0];
+    wire [15:0] imm = IR[15:0];
+
+    // control wires
+    wire pc_write, i_or_d, mem_read, mem_write, ir_write, reg_write, pc_write_cond;
+    wire [1:0] pc_source;
+    wire [1:0] reg_dst, alu_srcA, alu_srcB;
+    wire [2:0] alu_control;
+
+    wire fpu_start, fpu_reg_write, simd_start, simd_reg_write, cache_hit, cache_stall;
+    wire fpu_done;
+    wire simd_done;
+    wire [31:0] rf_data1, rf_data2;
+
+    // registers and internal buffers
+    reg [31:0] RegA, RegB;
+    wire [31:0] alu_result;
+    reg [31:0] ALUOut;
+    wire alu_zero;
+
+    // memory logic
+    assign mem_addr = i_or_d ? ALUOut : PC;
+    assign mem_write_data = RegB;
+    assign mem_global_read = mem_read;
+    assign mem_global_write = mem_write;
+
+    // 1. Instruction Cache Unit
+    L1_I_Cache instruction_cache (
+        .clk(clk), 
+        .rst(rst), 
+        .addr(PC), 
+        .mem_ready(mem_ready && cache_stall), 
+        .mem_block_in(mem_block_in), 
+        .instruction(instr),
+        .cache_hit(cache_hit), 
+        .cache_miss_req() 
+    );
+
+    always @(posedge clk or posedge rst) begin        
+        if (rst) begin
+            IR  <= 32'h0;
+            MDR <= 32'h0;
+        end else begin
+            if (ir_write && cache_hit) 
+                IR <= instr;
+            if (mem_read && i_or_d && mem_ready) 
+                MDR <= mem_data_in;
+        end
+    end
+
+    // 2. Main Control Unit
+    Control_Unit controller (
+        .clk(clk), .rst(rst), .opcode(opcode), .funct(funct), .cache_hit(cache_hit),
+        .fpu_done(fpu_done), .simd_done(simd_done), .mem_ready(mem_ready), .pc_write(pc_write), .pc_source(pc_source),
+        .i_or_d(i_or_d), .mem_read(mem_read), .mem_write(mem_write), .ir_write(ir_write),
+        .reg_dst(reg_dst), .reg_write(reg_write), .alu_srcA(alu_srcA), .alu_srcB(alu_srcB),
+        .alu_control(alu_control), .fpu_start(fpu_start), .fpu_reg_write(fpu_reg_write),
+        .simd_start(simd_start), .simd_reg_write(simd_reg_write), .cache_stall(cache_stall), .pc_write_cond(pc_write_cond)
+    );
+
+    // 3. Integer Execution Path
+    wire [4:0] write_reg_target = (reg_dst == 2'b01) ? rd : rt;
+    reg [31:0] reg_write_data;
+
+    always @(*) begin
+        if (opcode == `OP_LW) 
+            reg_write_data = MDR;
+        else 
+            reg_write_data = ALUOut;
+    end
+
+    RegisterFile_Int int_reg_file (
+        .clk(clk), .reg_write(reg_write), .read_reg1(rs), .read_reg2(rt),
+        .write_reg(write_reg_target), .write_data(reg_write_data),
+        .read_data1(rf_data1), .read_data2(rf_data2)
+    );
+
+    always @(posedge clk) begin        
+        RegA <= rf_data1;
+        RegB <= rf_data2;
+        if (!((mem_read || mem_write) && !mem_ready)) begin
+            ALUOut <= alu_result;
+        end
+    end
+
+    reg [31:0] alu_muxA, alu_muxB;
+    always @(*) begin
+        case (alu_srcA)
+            2'b00: alu_muxA = PC;
+            2'b01: alu_muxA = RegA;
+            default: alu_muxA = PC;
+        endcase
+
+        case (alu_srcB)
+            2'b00: alu_muxB = RegB;
+            2'b01: alu_muxB = 32'd4;
+            2'b10: alu_muxB = {{16{imm[15]}}, imm}; 
+            2'b11: alu_muxB = {{14{imm[15]}}, imm, 2'b00};
+            default: alu_muxB = RegB;
+        endcase
+    end
+
+    ALU_Int main_integer_alu (        
+        .a(alu_muxA), .b(alu_muxB), .alu_control(alu_control),
+        .result(alu_result), .zero(alu_zero)
+    );
+
+    wire pc_cond_write = alu_zero ? pc_write_cond : 0;   
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            PC <= 32'h00000000;
+        end else if (pc_write || pc_cond_write) begin
+            case (pc_source)
+                2'b00: PC <= alu_result;
+                2'b01: PC <= ALUOut;
+                2'b10: PC <= {PC[31:28], IR[25:0], 2'b00};
+                default: PC <= alu_result;
+            endcase
+        end
+    end
+
+    // 4. Floating Point Path Connection
+    wire [31:0] fpu_rf_out1, fpu_rf_out2, fpu_final_result;
+    wire fpu_ovf, fpu_unf;
+    
+    wire [1:0] fpu_op_mapped = (funct == `FUNCT_FADD) ? 2'b01 :
+                               (funct == `FUNCT_FSUB) ? 2'b10 :
+                               (funct == `FUNCT_FMUL) ? 2'b11 : 2'b00; 
+
+    RegisterFile_Float fpu_reg_file (
+        .clk(clk), .reg_write(fpu_reg_write), .read_reg1(rs), .read_reg2(rt),
+        .write_reg(rd), .write_data(fpu_final_result),
+        .read_data1(fpu_rf_out1), .read_data2(fpu_rf_out2)
+    );
+
+    FPU floating_point_unit (
+        .clk(clk), .rst(rst), .start(fpu_start), .fpu_op(fpu_op_mapped),
+        .operand_a(fpu_rf_out1), .operand_b(fpu_rf_out2),
+        .result(fpu_final_result), .done(fpu_done),
+        .overflow(fpu_ovf), .underflow(fpu_unf)
+    );
+
+    // 5. SIMD Vector Execution Path Connection
+    wire [127:0] vec_rf_out1, vec_rf_out2, vec_final_result;
+    RegisterFile_Vector simd_reg_file (
+        .clk(clk), .reg_write(simd_reg_write), .read_reg1(rs[3:0]), .read_reg2(rt[3:0]),
+        .write_reg(rd[3:0]), .write_data(vec_final_result),
+        .read_data1(vec_rf_out1), .read_data2(vec_rf_out2)
+    );
+
+    SIMD_Unit SIMD_Vector_Processing_Unit (
+        .clk(clk), .rst(rst), .start(simd_start), .simd_op(funct[1]), // FIXED: Use bit 1 instead of bit 0
+        .vec_a(vec_rf_out1), .vec_b(vec_rf_out2),
+        .vec_out(vec_final_result), .done(simd_done)
+    );
+
+endmodule
